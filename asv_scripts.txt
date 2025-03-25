@@ -1,0 +1,442 @@
+############################# 1 数据文件准备
+##1.1 把扩增子原始序列全部转移到一个文件夹内，包括平行样品、正反向序列。
+
+##1.2 准备qiime2需要用到的metadata文件和manifest（转化时用excel另存为文本文档（制表符文件））文件。
+
+##1.3 将metadata文件和manifest文件也上传服务器与00.rawdata在同一级。
+
+##1.4 把数据导入qiime2
+nohup qiime tools import \
+	--type SampleData[PairedEndSequencesWithQuality] \
+	--input-path manifest.txt --output-path paried-end-demux.qza \
+	--input-format PairedEndFastqManifestPhred33V2 &
+##1.5 查看数据质量
+qiime demux summarize --i-data paired-end-demux.qza --o-visualization paried-end-demux-summary.qzv
+
+############################# 2 数据质控+生成ASV
+
+##2.1 去除引物和barcode（bacode在去除引物的时候好像也同时去除了，barcode单端长6bp，
+qiime cutadapt trim-paired \
+      --i-demultiplexed-sequences paired-end-demux.qza \
+      --p-cores 36 \
+      --p-no-indels \
+      --p-front-f GTGCCAGCMGCCGCGGTAA \
+      --p-front-r GGACTACHVGGGTWTCTAAT  \
+      --o-trimmed-sequences primer-trimmed-demux.qza     
+
+##2.2 去除引物和barcode后，可视化qza文件
+qiime demux summarize --i-data primer-trimmed-demux.qza \
+	--o-visualization primer-trimmed-demux-summary.qzv
+
+##2.3 dada2直接合并、去噪、去嵌合体、生成特征表、代表序列一步完成，
+nohup qiime dada2 denoise-paired --i-demultiplexed-seqs primer-trimmed-demux.qza \
+  --p-trunc-len-f 200 --p-trunc-len-r 200 --p-n-threads 36 \
+  --o-table table.qrza --o-representative-sequences rep-seqs.qza \
+  --o-denoising-stats denoising-stats.qza &
+  nohup qiime dada2 denoise-paired --i-demultiplexed-seqs primer-trimmed-demux.qza --p-trunc-len-f 220 --p-trunc-len-r 220 --p-n-threads 36 --o-table table.qza --o-representative-sequences rep-seqs.qza --o-denoising-stats denoising-stats.qza &
+
+##2.3.1 可视化
+qiime metadata tabulate --m-input-file denoising-stats.qza --o-visualization denoising-stats.qzv
+qiime feature-table summarize --i-table table.qza --o-visualization table.qzv
+qiime feature-table tabulate-seqs --i-data rep-seqs.qza --o-visualization rep-seqs.qzv
+
+
+############################### 3 物种注释
+##3.1 采用qiime2的V4区分类器进行注释
+nohup qiime feature-classifier classify-sklearn \
+  --i-classifier /home/sun/YYL-2022/8-9m-gdgx-hn/SILVA_132_QIIME_release/silva-138-99-515-806-nb-classifier.qza \
+  --i-reads rep-seqs.qza --o-classification taxonomy.qza --p-n-jobs 32 &
+
+############################### 4 数据过滤
+##4.1 过滤污染 叶绿体 线粒体、
+nohup qiime taxa filter-table --i-table table.qza \
+  --i-taxonomy taxonomy.qza --p-exclude mitochondria,chloroplast \
+  --p-include p__ --o-filtered-table feature-table-filt-contam.qza &
+##可视化
+qiime feature-table summarize --i-table feature-table-filt-contam.qza \
+  --o-visualization feature-table-filt-contam.qzv
+
+##4.2 过滤稀有ASV， 可查看feature-table.qzv 确定过滤数量：--p-min-frequency；
+##    为所有tags数的 0.00005,共7百万条序列，万分之0.5为300左右（好像太严格了，使用50，也有选择10的）。
+qiime feature-table filter-features --i-table feature-table-filt-contam.qza --p-min-frequency 50 --p-min-samples 1 --o-filtered-table feature-table-final.qza
+##可视化
+qiime feature-table summarize --i-table feature-table-final.qza --o-visualization feature-table-final.qzv
+
+##4.3 更新一下 repset-seqs.qza,将过滤掉的ASV对应的序列过滤掉（由于去掉了部分ASV，因此对应的代表序列也要去掉一部分）
+qiime feature-table filter-seqs --i-table feature-table-final.qza --i-data rep-seqs.qza --o-filtered-data repset-seqs-final.qza
+
+##4.4 构建进化树16S分析
+nohup qiime phylogeny align-to-tree-mafft-fasttree \
+  --i-sequences ./10/repset-seqs-final.qza --o-alignment ./10/aligned-repset-seqs.qza \
+  --p-n-threads 64 --o-masked-alignment ./10/masked-aligned-repset-seqs.qza \
+  --o-tree ./10/unrooted-tree.qza --o-rooted-tree ./10/rooted-tree.qza &
+
+############################### 5 ASV表格添加物种注释信息
+##5.1 out表格添加物种注释信息
+#获得taxonomy.tsv
+qiime tools export \
+   --input-path taxa/taxonmony.qza --output-path taxa
+#处理表头
+sed -i -e '1 s/Feature ID/#Feature/' -e '1 s/Taxon/taxonomy/' ./taxonomy.tsv
+#导出otu(feature)表
+qiime tools export \
+   --input-path file_path/table_final.qza \
+   --output-path table_exported
+#添加物种注释信息
+biom add-metadata \
+   -i file_path/feature-table.biom \
+   -o file_path/feature-table_w_tax.biom \
+   --observation-metadata-fp file_path/taxonomy.tsv \
+   --sc-separated taxonomy
+#biom转换成txt格式
+biom convert \
+   -i file_path/feature-table_w_tax.biom \
+   -o file_path/feature-table_w_tax.txt \
+   --to-tsv \
+   --header-key taxonomy
+
+########################################################################
+########################################################################
+########################################################################
+
+############################### 6 使用microeco进行下游分析
+##6.1 数据导入+创建R6类型数据
+library(microeco)
+library(ape)
+setwd("/Users/Yeyonglian/Desktop/merge_new/")
+getwd()
+tax <- read.csv("tax_table.csv", check.names = FALSE) #物种注释表
+tax$OTUID <- make.unique(tax$ID) 
+row.names(tax) <- tax$ID
+tax <- tax[, -1]  # 移除重复的OTU_ID列
+asv <- read.csv("feature_table.csv", check.names = FALSE, row.names = 1) #asv表
+group <- read.csv("sample_table.csv", check.names = FALSE, row.names = 1) #分组表
+env_data <- read.csv("env_data.csv", check.names = FALSE, row.names = 1) #环境因子表
+tree <- read.tree("phylo_tree.tre") #进化树
+library(magrittr)
+library(ggplot2)
+theme_set(theme_bw())
+dataset <- microtable$new(sample_table = group, otu_table = asv, tax_table = tax, phylo_tree = tree) #创建R6类型数据
+class(dataset)
+print(dataset)
+
+##6.2 R6类型数据处理
+dataset$tax_table %<>% subset(Kingdom == "k__Archaea" | Kingdom == "k__Bacteria") #移除没有比对到"k__Archaea"和"k__Bacteria"域的OTU
+print(dataset)
+dataset$filter_pollution(taxa = c("mitochondria", "chloroplast")) #移除比对到"mitochondria"和"chloroplast"相关的OTU
+print(dataset)
+dataset$tidy_dataset() #然后为使otu_table，tax_table和phylo_tree中的OTU相同，使用tidy_dataset()
+print(dataset)
+dataset$sample_sums()%>% range #使用sample_sums检查每个样品的测序数量
+dataset$sample_sums()
+dataset$rarefy_samples(sample.size = 78665) #减少不同样品物种数目对多样性测量的影响，使用rarefy_samples进行稀释抽样
+#604 features are removed because they are no longer present in any sample after random subsampling ...
+#604 taxa with 0 abundance are removed from the otu_table ...
+dataset$sample_sums() %>% range
+devtools::install_github("ChiLiubio/mecodev")
+library(mecodev)
+set.seed(123)
+t1 <- trans_rarefy$new(dataset, alphadiv = "Observed", depth = c(0, 100, 500, 5000, 20000, 40000, 60000, 78665))
+t1$plot_rarefy(color = "Group2", show_point = FALSE, add_fitting = FALSE)
+
+##6.3 计算物种丰度
+dataset$cal_abund() #使用cal_abund计算每个分类水平物种丰度
+class(dataset$taxa_abund)
+dir.create("taxa_abund_rarefy_78665") 
+dataset$save_abund(dirpath = "taxa_abund_rarefy_78665") #保存物种丰度表
+###6.4 计算Alpha多样性
+#install.packages("nlme")
+library(nlme)
+library(picante)
+###使用cal_alphadiv函数
+dataset$cal_alphadiv(PD = TRUE) #如想增加系统发育多样性，使用PD =TRUE，速度略慢
+class(dataset$alpha_diversity)
+dir.create("alpha_diversity_rarefy_78665") #创建文件夹
+dataset$save_alphadiv(dirpath = "alpha_diversity_rarefy_78665") #保存alpha结果
+
+##6.4 计算Beta多样性
+#install.packages("GUniFrac")
+library(GUniFrac)
+###使用cal_betadiv函数，支持的距离类型：Bray-curtis, Jaccard, weighted Unifrac and unweighted unifrac.
+dataset$cal_betadiv(unifrac = FALSE)
+# 返回结果
+class(dataset$beta_diversity)
+# 保存
+dir.create("beta_diversity_rarefy_78665")
+dataset$save_betadiv(dirpath = "beta_diversity_rarefy_78665")
+
+##6.5 绘制群落组成图
+# 创造trans_abun对象
+# 使用排名前15 的门
+abun2 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", ntaxa = 20)
+# 在x轴上删除了样本名称，并添加了分面以根据组显示丰度。
+library(ggh4x)
+plot111 <- abun2$plot_bar(others_color = "grey70", facet = c("Group3", "Group2"), xtext_keep = FALSE, legend_text_italic = FALSE, barwidth = 0.7)
+plot111
+ggsave("figure/abundance_all——p.svg", plot = plot111, width = 10, height = 6, device = "svg")
+# 以组平均值绘制群落柱状图
+abun1 <- trans_abund$new(dataset = dataset, taxrank = "Phylum", ntaxa = 20, groupmean = "Group2")
+plot_group <- abun1$plot_bar(others_color = "grey70", legend_text_italic = FALSE,xtext_keep = TRUE)
+plot_group
+ggsave("figure/abundance_mean_p.svg", plot = plot_group, width = 10, height = 6, device = "svg")
+
+##6.6 绘制Venn图
+# 创建trans_venn对象
+tmp <- dataset$merge_samples("Group2")
+tmp
+ven1 <- trans_venn$new(dataset = tmp, ratio = "seqratio")
+ven1 <- trans_venn$new(dataset, ratio = "seqratio")# The percentage data is the sequence number/total sequence number
+ven <- trans_venn$new(dataset, ratio = NULL)
+vennn1 <- data.frame(ven1$data_details)
+head(vennn1)
+#输出计算结果
+write.csv(vennn1, 'ven_detial.csv')
+vennn2 <- data.frame(ven$otu_table)
+write.csv(vennn2, 'ven_asv_table.csv')
+venplot <- ven1$plot_venn(petal_plot = TRUE, petal_color = RColorBrewer::brewer.pal(8, "Dark2"))
+venplot
+ggsave("figure/ven111.svg", plot = venplot, width = 6, height = 6, device = "svg")
+#整数是OTU数量，括号中数据为测序数/总测序量
+tmp <- dataset$merge_samples("Group2")
+tmp
+t1 <- trans_venn$new(dataset = tmp)
+# only show some sets with large intersection numbers
+t1$data_summary %<>% .[.[, 1] > 20, ]
+#install.packages("aplot")
+library(aplot)
+g1 <- t1$plot_bar(left_plot = TRUE, bottom_height = 0.5, left_width = 0.15, up_bar_fill = "grey50", left_bar_fill = "grey50", bottom_point_color = "black")
+g1
+ggsave("figure/intersections_number.svg", plot = g1, width = 17, height = 10, device = "svg")
+# g1 is aplot class and can be saved with ggplot2::ggsave, aplot::ggsave or cowplot::save_plot function
+# as g1 is comprised of several sub-plots, please adjust the details for each sub-plot
+g1[[1]]
+g1[[2]]
+dataset1 <- dataset$merge_samples("Group2")
+t1 <- trans_venn$new(dataset1)
+# transform venn results to the sample-species table, here do not consider abundance, only use presence/absence.
+t2 <- t1$trans_comm(use_frequency = TRUE)
+# t2 is a new microtable class, each part is considered a sample
+class(t2)
+# calculate taxa abundance, that is, the frequency
+t2$cal_abund()
+# transform and plot
+t3 <- trans_abund$new(dataset = t2, taxrank = "Family", ntaxa = 15)
+g2 <- t3$plot_bar(bar_full = FALSE, legend_text_italic = T, xtext_angle = 30, color_values = RColorBrewer::brewer.pal(8, "Set2"),
+            order_x = c()) + ylab("Frequency (%)")
+g2
+ggsave("figure/intersections_number_ferquency_family.svg", plot = g2, width = 17, height = 10, device = "svg")
+#
+vennn <- data.frame(t3$data_abund)
+head(vennn)
+t3 <- trans_abund$new(dataset = t2, taxrank = "Family", ntaxa = 15)
+t3$data_abund$Sample %<>% factor(., levels = unique(.))
+ven_part <- t3$plot_pie(facet_nrow = 3, strip_text = 12, add_label = TRUE, legend_text_italic = FALSE,color_values = c(RColorBrewer::brewer.pal(8, "Dark2"), "grey50"))
+ven_part
+ggsave("figure/ven_part.svg", plot = ven_part, width = 8, height = 8, device = "svg")
+#输出计算结果
+write.csv(vennn, 'ven.csv')
+
+##6.7 alpha多样性指数差异比较
+alpha1 <- trans_alpha$new(dataset = dataset, group = "Group2")
+View(alpha1$data_stat)
+alpha_group_diff <- data.frame(alpha1$data_stat)
+write.csv(alpha_group_diff, 'alpha_group_diff.csv')
+# return t1$alpha_stat
+###使用KW秩和检验和多重矫正的Anova进行组间差异检验
+alpha1$cal_diff(method = "KW")
+head(alpha1$res_diff)
+alpha1$cal_diff(method = "anova")
+# return t1$res_alpha_diff
+alpha1$res_alpha_diff
+# return alpha1$res_diff
+View(alpha1$res_diff)
+##误差图
+library(ggpubr)
+Observed <- alpha1$plot_alpha(pair_compare = TRUE, measure = "Observed", add_sig = TRUE)
+Observed
+Chao1 <- alpha1$plot_alpha(add_letter = TRUE, measure = "Chao1")
+Chao1
+Shannon <- alpha1$plot_alpha( measure = "Shannon", add_sig_text_size = 6, boxplot_add = "jitter", order_x_mean = TRUE)
+Shannon
+PD <- alpha1$plot_alpha( measure = "PD", add_sig_text_size = 6, boxplot_add = "jitter", order_x_mean = TRUE)
+PD
+ggsave("figure/observed.svg", plot = Observed, width = 6, height = 6, device = "svg")
+ggsave("figure/chao1.svg", plot = Chao1, width = 6, height = 6, device = "svg")
+ggsave("figure/shannon.svg", plot = Shannon, width = 6, height = 6, device = "svg")
+ggsave("figure/pd.svg", plot = PD, width = 6, height = 6, device = "svg")
+
+##6.7 beta多样性指数差异比较
+
+##6.7.1 PCoA
+beta1 <- trans_beta$new(dataset = dataset, group = "Group2", measure = "wei_unifrac")
+beta1$cal_ordination(ordination = "PCoA")
+pcoa <- beta1$plot_ordination(plot_color = "Group2",plot_shape = "Group3",plot_type = c("point", "ellipse"),
+                              ellipse_level = 0.5 ,ellipse_chull_fill = FALSE,ellipse_type = "t",point_size = 4)
+pcoa
+ggsave("/Users/Yeyonglian/Desktop/merge_new/figure/pcoa3.svg", plot = pcoa, width = 8, height = 7, device = "svg")
+
+##### PCoA with box plot
+t3 <- trans_beta$new(dataset = dataset, group = "Group2", measure = "bray")
+t3$cal_ordination(ordination = "PCoA")
+# extract the axis scores
+tmp <- t3$res_ordination$scores
+# differential test with trans_env class
+t4 <- trans_env$new(dataset = dataset, add_data = tmp[, 1:2])
+t4$cal_diff(group = "Group2", method = "anova")
+p1 <- t3$plot_ordination(plot_color = "Group2",plot_shape = "Group2",plot_type = c("point", "ellipse"))
+# groups order in p2 is same with p1; use legend.position = "none" to remove redundant legend
+p2 <- t4$plot_diff(measure = "PCo1", add_sig = T) + theme_bw() + coord_flip() + 
+  theme(legend.position = "none", axis.title.x = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+p3 <- t4$plot_diff(measure = "PCo2", add_sig = T) + theme_bw() + 
+  theme(legend.position = "none", axis.title.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+# height of the upper figure and width of the right-hand figure are both 0.2-fold of the main figure
+g <- p1 %>% insert_top(p2, height = 0.2) %>% insert_right(p3, width = 0.2)
+g
+
+##### plot and compare the group distances.
+# calculate and plot sample distances within groups
+beta1$cal_group_distance(within_group = TRUE)
+# perform Wilcoxon Rank Sum and Signed Rank Tests
+beta1$cal_group_distance_diff(method = "anova")
+bray_c <- data.frame(beta1$res_group_distance)
+write.csv(bray_c,'bray_cruits.csv')
+# plot_group_order parameter can be used to adjust orders in x axis
+weigh_uni <- beta1$plot_group_distance()
+weigh_uni
+ggsave("figure/bray.svg", plot = weigh_uni, width = 6, height = 6, device = "svg")
+
+##6.8 RDA分析
+
+## 6.8.1 环境因子的差异比较
+#install.packages("mice")
+library(mice)
+rda <- trans_env$new(dataset = dataset, add_data = env_data[, 1:11], complete_na = TRUE) # add_data 用于增加环境数据
+new_test <- clone(dataset)
+new_test$sample_table <- data.frame(new_test$sample_table, env_data[rownames(new_test$sample_table), ])
+# now new_test$sample_table has the whole data
+new_test
+rda <- trans_env$new(dataset = new_test, env_cols = 4:14)
+# use Wilcoxon Rank Sum Test as an example
+rda$cal_diff(group = "Group2", method = "anova")
+View(rda$res_diff)
+env_diff <- data.frame(rda$res_diff)
+head(env_diff)
+write.csv(env_diff, 'env_diff.csv') #输出计算结果
+## 绘图1
+library(agricolae)
+rda$cal_diff(method = "anova", group = "Group2")
+rda$plot_diff(measure = "SAL", add_sig_text_size = 5, xtext_size = 12) + theme(plot.margin = unit(c(0.1, 0, 0, 1), "cm"))
+# Run the anova comparison for the specified group
+rda$cal_diff(method = "anova", group = "Group2")
+library(ggplot2)
+library(gridExtra)
+tmp <- list()
+for (i in colnames(rda$data_env)) {
+  plot <- rda$plot_diff(measure = i, add_sig_text_size = 6, xtext_size = 20) +
+    theme(
+      axis.text.x = element_text(size = 16, angle = 0, hjust = 0.5),  # 修改 x 轴字体大小和旋转
+      axis.text.y = element_text(size = 16),  # 修改 y 轴字体大小
+      axis.title.x = element_text(size = 18),  # 修改 x 轴标签字体大小
+      axis.title.y = element_text(size = 20, margin = margin(r = 5)),  # 修改 y 轴标签字体大小，并设置右边距
+      plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm"),
+      panel.background = element_rect(fill = NA, color = NA)  # 设置面板背景为透明
+    )
+  
+  tmp[[i]] <- plot
+}
+# Arrange the plots into a grid
+grid_plot <- gridExtra::arrangeGrob(grobs = tmp, ncol = 3)
+grid_plot
+# Save the grid of plots as an SVG file
+ggsave("figure/env_diff.svg", plot = grid_plot, width = 20, height = 16, device = "svg")
+## 绘图2
+#install.packages("GGally")
+library(GGally)
+# require GGally package to be installed
+# Run the autocorrelation calculation and capture the plot
+# Run the autocorrelation calculation and capture the plot
+env_corr <- rda$cal_autocor(group = "Group2")
+# Modify font sizes using ggplot2 theme functions
+env_corr <- env_corr + 
+  theme(
+    text = element_text(size = 16), # Global text size
+    axis.title = element_text(size = 16), # Axis title size
+    axis.text = element_text(size = 16),  # Axis text size
+    plot.title = element_text(size = 16)  # Plot title size
+  )
+
+# Display the modified plot
+print(env_corr)
+# Optionally save the modified plot
+ggsave("figure/env_corr_custom.svg", plot = env_corr, width = 10, height = 8, device = "svg")
+ggsave("figure/env_coorr.svg", plot = env_corr, width = 40, height = 42, device = "svg")
+
+## 6.8.2 use bray-curtis distance for dbRDA
+rda$cal_ordination(method = "dbRDA", use_measure = "bray",group = "Group2")
+t1$cal_ordination_anova()
+rda$cal_ordination_envfit()
+rda$cal_ordination(method = "RDA",group = "Group2",taxa_level = "Family")
+rda$trans_ordination() 
+rda$plot_ordination(plot_color = "Group2")
+# the main results of RDA are related with the projection and angles between arrows
+# adjust the length of the arrows to show them better
+rda$trans_ordination(adjust_arrow_length = TRUE , show_taxa = 15)
+# t1$res_rda_trans is the transformed result for plotting
+dbRDA <- rda$plot_ordination(plot_color = "Group2")
+dbRDA
+rda$cal_ordination_envfit(group = "Group2")
+env_fit <- data.frame(rda$res_ordination_envfit)
+rda$cal_mantel(by_group = "Group2", use_measure = "bray",method = "spearman")
+View(rda$res_mantel)
+env_mantel <- data.frame(rda$res_mantel)
+write.csv(env_mantel, 'env_mantel.csv')
+ggsave("figure/bray_rda.svg", plot = dbRDA, width = 8, height = 8, device = "svg")
+
+##6.9 null model分析
+
+env_data2 <- read.csv("env_data.csv", check.names = FALSE, row.names = 1) #环境因子表
+model1 <- trans_nullmodel$new(dataset, filter_thres = 0.0005, add_data = env_data2)
+model1$cal_ses_betampd(runs = 500, abundance.weighted = TRUE) # null model run 500 times for the example
+dataset$beta_diversity[["betaNRI"]] <- model1$res_ses_betampd
+model2 <- trans_beta$new(dataset = dataset, group = "Group2", measure = "betaNRI") # create trans_beta class, use measure "betaNRI"
+model2$cal_group_distance()
+result3 <- data.frame(model2$res_group_distance)
+write.csv(result3, 'result_betaNRI.csv')
+model2$cal_group_distance_diff(method = "anova") # see the help document for more methods, e.g. "anova" and "KW_dunn"
+# plot the results
+g1 <- model2$plot_group_distance(boxplot_add = "mean") #
+g2 <- g1 + geom_hline(yintercept = -2, linetype = 2) + geom_hline(yintercept = 2, linetype = 2)
+g2
+ggsave("figure/betaNRI.svg", plot = g2, width = 6, height = 6, device = "svg")
+model1$cal_ses_betamntd(runs = 500, abundance.weighted = TRUE, null.model = "taxa.labels")# null model run 500 times
+model1$res_ses_betamntd
+dataset$beta_diversity[["betaNTI"]] <- model1$res_ses_betamntd
+# create trans_beta class, use measure "betaNTI"
+model3 <- trans_beta$new(dataset = dataset, group = "Group2", measure = "betaNTI")
+# transform the distance for each group
+model3$cal_group_distance()
+# see the help document for more methods, e.g. "anova" and "KW_dunn"
+model3$cal_group_distance_diff(method = "anova")
+# plot the results
+g3 <- model3$plot_group_distance(boxplot_add = "mean") #
+g4 <- g3 + geom_hline(yintercept = -2, linetype = 2) + geom_hline(yintercept = 2, linetype = 2)
+g4
+ggsave("figure/betaNTI.svg", plot = g4, width = 6, height = 6, device = "svg")
+result2 <- data.frame(model1$res_ses_betamntd)
+#输出计算结果
+write.csv(result2, 'result_betamntd.csv')
+# result stored in model1$res_rcbray
+model1$cal_rcbray(runs = 1000)
+# return t1$res_rcbray
+# use betaNTI and rcbray to evaluate processes
+model1$cal_process(use_betamntd = TRUE, group = "Group2") 
+model1$res_process
+#提取计算结果
+View(model1$res_rcbray)
+result <- data.frame(model1$res_process)
+result3 <- data.frame(model1$res_rcbray)
+head(result)
+#输出计算结果
+write.csv(result3, 'rcbray_Group.csv')
+
+
