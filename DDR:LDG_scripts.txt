@@ -1,0 +1,99 @@
+getwd()
+setwd("/Users/Yeyonglian/Desktop/扩增子/ddr/")
+env <- read.table("env_data_merge.txt",header = TRUE, sep = "\t", row.names = 1,
+                  as.is = TRUE, stringsAsFactors = FALSE, comment.char = "",
+                  check.names = FALSE)
+otu <- read.table("merged_asv.txt",header = TRUE, sep = "\t", row.names = 1,
+                  as.is = TRUE, stringsAsFactors = FALSE, comment.char = "",
+                  check.names = FALSE)
+taxon <- read.table("Taxonomy_table.txt",header = TRUE, sep = "\t", row.names = 1,
+                    as.is = TRUE, stringsAsFactors = FALSE, comment.char = "",
+                    check.names = FALSE)
+geo <- read.table("geo.txt",header = TRUE, sep = "\t", row.names = 1,
+                  as.is = TRUE, stringsAsFactors = FALSE, comment.char = "",
+                  check.names = FALSE)
+library(pacman)
+p_load(ggplot2,reshape2,patchwork,vegan,geosphere,psych,corrplot)
+otu_abun <- otu/colSums(otu) #relative_abundance
+# 加载必要的库
+library(dplyr)
+# 查看数据框的行数
+nrow_otu_abun <- nrow(otu_abun)
+nrow_taxon <- nrow(taxon)
+cat("otu_abun 行数:", nrow_otu_abun, "\n")
+cat("taxon 行数:", nrow_taxon, "\n")
+# 查看行名称
+head(rownames(otu_abun))
+head(rownames(taxon))
+# 确保行名相同（如果适用）
+if (!identical(rownames(otu_abun), rownames(taxon))) {
+  cat("行名不一致\n")
+  # 找到共有的行名
+  common_rows <- intersect(rownames(otu_abun), rownames(taxon))
+  # 过滤掉非共有行
+  otu_abun <- otu_abun[common_rows, ]
+  taxon <- taxon[common_rows, ]
+}
+# 检查行数是否一致
+if (nrow(otu_abun) != nrow(taxon)) {
+  stop("otu_abun 和 taxon 必须具有相同的行数")
+}
+# 确保行名相同（可选，但有助于检查）
+rownames(otu_abun) <- rownames(taxon)
+# 按 Phylum 聚合丰度数据
+otu_abun$Phylum <- taxon$Phylum
+# 使用 aggregate 函数按 Phylum 聚合数据
+p <- aggregate(. ~ Phylum, data = otu_abun, sum)
+# 查看结果
+print(p)
+p<- aggregate(otu_abun, by=list(taxon$Phylum), sum) #phylum level
+rownames(p) <- p$Group.1
+p <- p[,-1]
+top <- names(head(sort(rowSums(p), decreasing = T), 57)) 
+otu <- as.data.frame(t(otu))
+richness <- specnumber(otu) #计算丰富度
+shannon <- diversity(otu,index = "shannon") #计算shannon 多样性
+diversity <- data.frame(richness,shannon)
+aa <- cbind(geo, diversity)
+summary(lm(aa$richness ~ aa$lat))
+summary(lm(aa$shannon ~ aa$lat))
+p1 <- ggplot(aa,aes(x = latitude, y = richness))+
+  geom_point()+
+  geom_smooth(method = "lm",alpha = 0.2)
+p2 <- ggplot(aa,aes(x = latitude, y = shannon))+
+  geom_point()+
+  geom_smooth(method = "lm",alpha = 0.2)
+plot <- p1 + p2
+plot
+
+diversity <- data.frame(richness,shannon)
+cor_soil <- corr.test(diversity, env[,1:12], method = "spearman", adjust = "none")
+cor_soil_r <- cor_soil$r
+cor_soil_p <- cor_soil$p
+cor_soil_p[cor_soil_p >= 0.05] <- -1
+cor_soil_p[cor_soil_p < 0.05 & cor_soil_p >= 0] <- 1
+cor_soil_p[cor_soil_p == -1] <- 0
+corr_soil <- cor_soil_r*cor_soil_p
+col<-colorRampPalette(c("#77AADD","#4477AA","#FFFFFF",
+                        "#EE9988","#BB4444"))
+corrplot(corr_soil, method = 'color', addCoef.col = 'black', number.cex = 0.8,
+         rect.col = "black",addgrid.col = "black",col = col(200),tl.col = 'black', cl.pos = "n")
+#######DDR
+d.geo <- distm(geo, fun = distHaversine) 
+dist.geo <- as.dist(d.geo)
+dist_geo <- as.data.frame(as.vector(dist.geo))
+dist_geo <- dist_geo/1000
+colnames(dist_geo) <- "dist_geo"
+dist.otu <- vegdist(otu, method = "bray")
+?vegdist
+dist_otu <- as.data.frame(as.vector(dist.otu))
+colnames(dist_otu) <- "dist_otu"
+data <- data.frame(dist_geo, dist_otu)
+data$dist_otu <- 1-data$dist_otu
+data$dist_otu <- data$dist_otu * 100 #转换为百分比
+summary(lm(data$dist_otu ~ data$dist_geo))
+?geom_smooth
+ggplot(data, aes(x = dist_geo,y = dist_otu)) +
+  geom_point() +
+  geom_smooth(method = "glm",alpha = 0.5) +
+  labs(x = "Geographic Distance (Km)", y = "Community Similarity (%) ")
