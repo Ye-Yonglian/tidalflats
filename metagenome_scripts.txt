@@ -1,0 +1,115 @@
+############### 1 assembly 
+nohup metawrap assembly -t 16 
+	-o /megahit_result
+	-1 ./file1.1.fq 
+	-2 ./file1.2.fq 
+	-m 1024 &
+
+############### 2 annotation
+## 2.1 prokka
+nohup prokka ./file1_assembly.fasta
+	--outdir ./prokka_file1
+	--prefix prokka_file1
+	--metagenome 
+	--gcode 11 
+	--cpus 16 &
+
+## 2.2 eggnog
+nohup emapper.py 
+	-i ./prokka_file1.faa 
+	--output egg_file1 -m diamond --cpu 20 &
+
+## 2.3 abundance
+2.3.1 bwa index
+nohup bwa index -p file1_assembly -a bwtsw file1_assembly.fasta &
+（ -p 输出数据库的前缀；【默认和输入的文件名一致，输出的数据库在其输入文件所在的文件夹，并以该文件名为前缀。】）
+2.3.2 bwa mem
+bwa mem -t 16 
+	./file1_assembly
+	./file1.1.fq 
+	./file1.1.fq   > file1_assembly.sam
+
+2.3.3 sam转换bam
+nohup samtools view -bS file1_assembly.sam > file1_assembly.bam &
+
+2.3.4 flagstat
+给出BAM文件的比对结果
+nohup samtools flagstat file1_assembly.bam > file1_assembly_flagstat.txt & 
+
+2.3.5 samtools sort
+对bam文件进行排序，之后基因丰度需要用到，然后就可以删除sam文件了
+nohup samtools sort file1_assembly.bam -m 1G -o file1_assembly_sort.bam &
+
+2.3.6 bedtools
+准备：需要使用prokka中的文件gff
+如何处理gff:
+2.3.6.1 vim xxx.gff，使用搜索指令找到/##FASTA，记录右下角显示的行数
+2.3.6.2 使用搜索指令找到?##sequence，记录右下角显示的行数
+2.3.6.3 切除##FASTA及后面的部分，切除##sequence前面的部分
+	sed -n "2440672,3224408p" 1.gff >2.gff
+2.3.6.4回头vim看一下是否还有未切的行
+	vim xxx.gff，
+2.3.6.5 切除每列”；“之后的内容
+	cut -f 1 -d ";" 2 >3
+2.3.6.6 切除出需要的几列
+	cut -f 1,4,5,9 3 >4
+2.3.6.7 运行bedtools
+	nohup bedtools coverage -a file1_assembly.gff  -b  file1_assembly_sort.bam > file1_assembly_bedtools &
+
+##2.7 统计（累加）同一基因的覆盖度结果
+
+测序深度=reads number（6.7结果第5列） * reads length  / 基因长度（6.7结果第3列-第2列）
+
+############### 3 binning
+## 3.1 binning
+nohup metawrap binning --metabat2  --maxbin2 --concoct
+	-a cfile1_assembly.fasta 
+	-o file1_binning_result 
+	-t 12 -m 500 file1_1.fq file1_2.fq &
+
+## 3.2 bin_refinement
+nohup metawrap bin_refinement 
+	-A file1_binning_result/concoct_bins 
+	-B file1_binning_result/maxbin2_bins 
+	-C file1_binning_result/metabat2_bins/ 
+	-o file1_binning_result/bin_refine 
+	-t 8 -m 500 -c 50 -x 10 &
+
+##3.3 dereplicate
+nohup dRep dereplicate 
+	-g ./all_MAGs 
+	-p 24 -l 2000 
+	-comp 50 -con 10
+	-o ./dereplicate_result & ####所有MAGs一起去冗余
+
+############### 4 coverM
+nohup coverm genome 
+	-m relative_abundance 
+	-b sort_bam文件 
+	--genome-fasta-directory 基因组文件  
+	--min-read-percent-identity 95 
+	--min-read-aligned-percent 75 
+	--threads 16 
+	--min-read-aligned-length 50 -x fasta  > 输出路径 &
+
+############### 5 GTDB
+##5.1 物种注释
+gtdbtk classify_wf --genome_dir bin \
+    --out_dir classify_wf \
+    --extension fasta \
+    --prefix bin \
+    --cpus 8
+##5.2 建树
+gtdbtk infer \
+    --msa_file classify_wf/bin.bac120.user_msa.fasta \
+    --out_dir infer \
+    --cpus 8 \
+    --prefix bin
+
+
+
+
+
+
+
+
